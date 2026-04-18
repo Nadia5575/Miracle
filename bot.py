@@ -1,392 +1,448 @@
 """
-Amazon Price Tracker Bot - @طلعت
-Telegram Bot + Continuous Price Monitoring
+Amazon Price Tracker Bot - Replit Edition v2
+@طلعت
 """
 import os
 import asyncio
 import logging
+import sqlite3
+import re
+import random
 from datetime import datetime
-from dotenv import load_dotenv
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, MessageHandler, filters
+    ContextTypes, MessageHandler, filters,
+    ConversationHandler
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from scraper import AmazonScraper
-from database import Database
 
-load_dotenv()
+# ─── Config ───────────────────────────────────────────────
+BOT_TOKEN  = os.environ.get("BOT_TOKEN",  "8767106185:AAGj59r0n7crVv6u-pINbAI49UbKv9u9thg")
+CHAT_ID    = os.environ.get("CHAT_ID",    "874575996")
+CHECK_MINS = int(os.environ.get("CHECK_INTERVAL_MINUTES", "30"))
+DB_PATH    = "data/tracker.db"
+
+# Conversation states
+ASK_URL    = 1
+ASK_TARGET = 2
+
+# ─── Logging ──────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
-    handlers=[
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN  = os.getenv("BOT_TOKEN", "")
-CHAT_ID    = os.getenv("CHAT_ID", "")
-CHECK_MINS = int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
+# ─── Database ─────────────────────────────────────────────
+os.makedirs("data", exist_ok=True)
 
-db      = Database("data/tracker.db")
-scraper = AmazonScraper()
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
+def init_db():
+    with get_conn() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS products (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                url            TEXT NOT NULL,
+                asin           TEXT,
+                title          TEXT DEFAULT 'Unknown',
+                current_price  REAL,
+                prev_price     REAL,
+                target_price   REAL,
+                currency       TEXT DEFAULT 'EGP',
+                added_at       TEXT DEFAULT (datetime('now')),
+                last_checked   TEXT
+            );
+            CREATE TABLE IF NOT EXISTS price_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id  INTEGER NOT NULL,
+                price       REAL,
+                recorded_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+            );
+        """)
+    logger.info("✅ Database ready")
 
-# ─── Helpers ────────────────────────────────────────────────
-def fmt_price(price, currency="EGP"):
-    if price is None:
-        return "غير متاح"
-    return f"{price:,.2f} {currency}"
+# ─── Scraper ──────────────────────────────────────────────
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
 
-def price_arrow(current, previous):
-    if previous is None or current is None:
-        return ""
-    if current < previous:
-        pct = (previous - current) / previous * 100
-        return f"📉 انخفض {pct:.1f}%"
-    if current > previous:
-        pct = (current - previous) / previous * 100
-        return f"📈 ارتفع {pct:.1f}%"
-    return "➡ بدون تغيير"
+def extract_asin(url: str) -> str:
+    m = re.search(r"/dp/([A-Z0-9]{10})", url)
+    return m.group(1) if m else ""
 
+def clean_url(url: str) -> str:
+    asin = extract_asin(url)
+    if asin:
+        if "amazon.eg" in url:
+            return f"https://www.amazon.eg/dp/{asin}"
+        else:
+            return f"https://www.amazon.com/dp/{asin}"
+    return url
 
-# ─── Commands ────────────────────────────────────────────────
+def scrape_amazon(url: str) -> dict:
+    import urllib.request
+    import urllib.error
+    import gzip
+
+    url = clean_url(url)
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+            try:
+                html = gzip.decompress(raw).decode("utf-8", errors="ignore")
+            except Exception:
+                html = raw.decode("utf-8", errors="ignore")
+
+        # Title
+        title = "Unknown"
+        for pattern in [
+            r'id="productTitle"[^>]*>\s*(.+?)\s*</span>',
+            r'<title>([^|<]{10,})',
+        ]:
+            m = re.search(pattern, html, re.DOTALL)
+            if m:
+                title = re.sub(r'\s+', ' ', m.group(1)).strip()
+                if len(title) > 10:
+                    break
+
+        # Price
+        price = None
+        for pattern in [
+            r'"priceAmount"\s*:\s*([\d.]+)',
+            r'class="a-price-whole">\s*([0-9,]+)',
+            r'"price"\s*:\s*"EGP\s*([\d,]+)',
+            r'"buyingPrice"\s*:\s*([\d.]+)',
+            r'id="priceblock_ourprice"[^>]*>[^0-9]*([\d,]+)',
+        ]:
+            m = re.search(pattern, html)
+            if m:
+                try:
+                    p = float(m.group(1).replace(",", ""))
+                    if p > 0:
+                        price = p
+                        break
+                except Exception:
+                    continue
+
+        currency = "EGP" if "amazon.eg" in url else "USD"
+        logger.info(f"Scraped | Price: {price} | Title: {title[:40]}")
+        return {"title": title, "price": price, "currency": currency, "asin": extract_asin(url), "url": url}
+
+    except Exception as e:
+        logger.error(f"Scrape error: {e}")
+        return {"title": "Unknown", "price": None, "currency": "EGP", "asin": extract_asin(url), "url": url}
+
+# ─── /start & /help ───────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "🤖 <b>أهلاً! أنا بوت متابعة أسعار أمازون</b>\n\n"
-        "📋 <b>الأوامر المتاحة:</b>\n\n"
-        "/add <code>رابط [سعر_مستهدف]</code> — إضافة منتج\n"
-        "/list — عرض كل المنتجات المتابَعة\n"
-        "/check — فحص الأسعار الآن\n"
-        "/remove <code>رقم</code> — حذف منتج\n"
-        "/status — حالة البوت\n"
-        "/help — المساعدة\n\n"
-        "💡 <b>مثال:</b>\n"
-        "<code>/add https://amazon.eg/dp/B0ABC123 500</code>"
+    await update.message.reply_text(
+        "👋 *أهلاً! أنا بوت متابعة أسعار أمازون*\n\n"
+        "📌 *الأوامر:*\n"
+        "➕ /add — إضافة منتج\n"
+        "📋 /list — المنتجات المتابَعة\n"
+        "🔍 /check — فحص الأسعار الآن\n"
+        "📊 /status — حالة البوت\n"
+        "🗑 /remove [id] — حذف منتج",
+        parse_mode="Markdown"
     )
-    await update.message.reply_text(text, parse_mode="HTML")
 
-
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "📖 <b>دليل الاستخدام</b>\n\n"
-        "1️⃣ <b>إضافة منتج:</b>\n"
-        "<code>/add https://amazon.eg/dp/XXXXXXXXXX</code>\n"
-        "<code>/add https://amzn.to/XXXXXX 299.99</code>\n\n"
-        "2️⃣ <b>الروابط المدعومة:</b>\n"
-        "• amazon.eg / amazon.com / amazon.sa\n"
-        "• amazon.ae / amazon.co.uk / amazon.de\n"
-        "• amazon.fr / amazon.it / amazon.es\n"
-        "• amzn.to (روابط مختصرة)\n\n"
-        "3️⃣ <b>أنواع التنبيهات:</b>\n"
-        "🔔 تخفيض جديد عن السعر السابق\n"
-        "🎯 وصل السعر المستهدف\n"
-        "⚡ قريب من السعر المستهدف (±10%)\n\n"
-        f"⏱ التحديث التلقائي: كل <b>{CHECK_MINS} دقيقة</b>"
+# ─── /add ConversationHandler ─────────────────────────────
+async def add_step1_ask_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Step 1: طلب الرابط"""
+    await update.message.reply_text(
+        "📎 *أرسل رابط المنتج من Amazon:*\n\n"
+        "_(أرسل /cancel للإلغاء)_",
+        parse_mode="Markdown"
     )
-    await update.message.reply_text(text, parse_mode="HTML")
+    return ASK_URL
 
+async def add_step2_got_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Step 2: استقبال الرابط، جلب السعر، سؤال عن الهدف"""
+    url = update.message.text.strip()
 
-async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    args = ctx.args
-    if not args:
-        await update.message.reply_text(
-            "❌ استخدم: <code>/add رابط_المنتج [سعر_مستهدف]</code>",
-            parse_mode="HTML"
+    if "amazon" not in url:
+        await update.message.reply_text("❗ الرابط لازم من Amazon، حاول مرة تانية:")
+        return ASK_URL
+
+    msg = await update.message.reply_text("⏳ جاري جلب بيانات المنتج...")
+    data = scrape_amazon(url)
+    ctx.user_data["pending_url"]  = url
+    ctx.user_data["pending_data"] = data
+
+    price_text = f"*{data['price']:,.0f} {data['currency']}*" if data["price"] else "⚠️ لم يُجلب (سيُحاول لاحقاً)"
+
+    await msg.edit_text(
+        f"✅ *تم جلب المنتج:*\n\n"
+        f"📦 {data['title'][:70]}\n"
+        f"💰 السعر الحالي: {price_text}\n\n"
+        f"🎯 *كم السعر المستهدف؟*\n"
+        f"_(أرسل رقم مثل* 500 *— أو* 0 *لمتابعة بدون هدف)_",
+        parse_mode="Markdown"
+    )
+    return ASK_TARGET
+
+async def add_step3_got_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Step 3: استقبال الهدف وحفظ المنتج"""
+    text = update.message.text.strip()
+    try:
+        target = float(text.replace(",", "")) if text != "0" else None
+    except ValueError:
+        await update.message.reply_text("❗ أرسل رقم فقط، مثال: 500 أو 0")
+        return ASK_TARGET
+
+    data = ctx.user_data.get("pending_data", {})
+    url  = ctx.user_data.get("pending_url", "")
+
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO products (url, asin, title, current_price, target_price, currency) VALUES (?,?,?,?,?,?)",
+            (url, data.get("asin",""), data.get("title","Unknown"),
+             data.get("price"), target, data.get("currency","EGP"))
         )
-        return
+        pid = cur.lastrowid
+        if data.get("price"):
+            conn.execute("INSERT INTO price_history (product_id, price) VALUES (?,?)",
+                         (pid, data["price"]))
 
-    url    = args[0].strip()
-    target = None
-    if len(args) >= 2:
-        try:
-            target = float(args[1])
-        except ValueError:
-            await update.message.reply_text("❌ السعر المستهدف يجب أن يكون رقماً")
-            return
+    price_text  = f"{data['price']:,.0f} {data.get('currency','EGP')}" if data.get("price") else "غير متاح"
+    target_text = f"*{target:,.0f} {data.get('currency','EGP')}*" if target else "بدون هدف"
 
-    if not scraper.is_amazon_url(url):
-        await update.message.reply_text(
-            "❌ الرابط غير صحيح. يجب أن يكون رابط أمازون صحيح\n"
-            "مثال: https://amazon.eg/dp/B0ABC12345"
-        )
-        return
-
-    msg = await update.message.reply_text("⏳ جارٍ جلب بيانات المنتج...")
-
-    product = await asyncio.get_event_loop().run_in_executor(
-        None, scraper.get_product, url
+    ctx.user_data.clear()
+    await update.message.reply_text(
+        f"✅ *تمت الإضافة!*\n\n"
+        f"🆔 ID: `{pid}`\n"
+        f"📦 {data.get('title','Unknown')[:60]}\n"
+        f"💰 السعر الحالي: *{price_text}*\n"
+        f"🎯 السعر المستهدف: {target_text}\n\n"
+        f"سأخطرك عند تغيير السعر 🔔",
+        parse_mode="Markdown"
     )
+    return ConversationHandler.END
 
-    if not product or product.get("price") is None:
-        await msg.edit_text(
-            "⚠️ <b>تعذّر جلب سعر المنتج</b>\n\n"
-            "أسباب محتملة:\n"
-            "• المنتج غير متاح حالياً\n"
-            "• أمازون حجبت الطلب مؤقتاً\n"
-            "• الرابط غير صحيح\n\n"
-            "المنتج أُضيف وسيُحاول جلب السعر في الفحص القادم.",
-            parse_mode="HTML"
-        )
-        db.add_product(url, target, title="غير معروف", current_price=None)
-        return
+async def cancel_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    await update.message.reply_text("❌ تم الإلغاء.")
+    return ConversationHandler.END
 
-    pid = db.add_product(
-        url    = url,
-        target = target,
-        title  = product["title"],
-        current_price = product["price"],
-        currency      = product.get("currency", "EGP"),
-        asin          = product.get("asin")
-    )
-
-    tgt_line = f"\n🎯 سعرك المستهدف: <b>{fmt_price(target, product.get('currency','EGP'))}</b>" if target else ""
-    text = (
-        f"✅ <b>تمت إضافة المنتج بنجاح!</b>\n\n"
-        f"📦 {product['title'][:80]}\n"
-        f"💰 السعر الحالي: <b>{fmt_price(product['price'], product.get('currency','EGP'))}</b>"
-        f"{tgt_line}\n"
-        f"🆔 رقم التتبع: <code>#{pid}</code>"
-    )
-    await msg.edit_text(text, parse_mode="HTML")
-
-
+# ─── /list ────────────────────────────────────────────────
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    products = db.get_all_products()
-    if not products:
-        await update.message.reply_text(
-            "📭 لا توجد منتجات مضافة بعد\n"
-            "استخدم <code>/add رابط</code> لإضافة منتج",
-            parse_mode="HTML"
-        )
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM products ORDER BY id").fetchall()
+
+    if not rows:
+        await update.message.reply_text("📭 لا يوجد منتجات.\n\nاستخدم /add لإضافة منتج.")
         return
 
-    lines = ["📋 <b>المنتجات المتابَعة:</b>\n"]
-    for i, p in enumerate(products, 1):
-        price_str = fmt_price(p["current_price"], p.get("currency", "EGP"))
-        tgt_str   = fmt_price(p["target_price"],  p.get("currency", "EGP")) if p["target_price"] else "—"
-        status    = "🎯" if p.get("target_reached") else "✅" if p.get("available") else "❌"
-        lines.append(
-            f"{status} <b>#{i} — {p['title'][:45]}...</b>\n"
-            f"   💰 {price_str}  |  🎯 هدف: {tgt_str}\n"
-            f"   🕐 آخر فحص: {p.get('last_checked','—')}\n"
-        )
-
-    # Inline keyboard for each product
     keyboard = []
-    for i, p in enumerate(products, 1):
+    for r in rows:
+        price  = f"{r['current_price']:,.0f} {r['currency']}" if r["current_price"] else "غير متاح"
+        target = f" | 🎯{r['target_price']:,.0f}" if r["target_price"] else ""
         keyboard.append([
-            InlineKeyboardButton(f"🗑 حذف #{i}", callback_data=f"del_{p['id']}"),
-            InlineKeyboardButton(f"🔗 فتح #{i}", url=p["url"])
+            InlineKeyboardButton(f"#{r['id']} {r['title'][:22]}.. {price}{target}", callback_data=f"info_{r['id']}"),
+        ])
+        keyboard.append([
+            InlineKeyboardButton(f"🗑 حذف", callback_data=f"del_{r['id']}"),
+            InlineKeyboardButton(f"🔗 فتح", url=r["url"]),
         ])
 
     await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="HTML",
+        f"📋 *المنتجات المتابَعة ({len(rows)}):*",
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-
+# ─── /check ───────────────────────────────────────────────
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    products = db.get_all_products()
-    if not products:
-        await update.message.reply_text("📭 لا توجد منتجات للفحص")
+    with get_conn() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    if count == 0:
+        await update.message.reply_text("📭 لا يوجد منتجات للفحص.")
         return
+    msg = await update.message.reply_text(f"🔍 جاري فحص {count} منتج...")
+    result = await check_prices(ctx.application.bot, notify=False)
+    await msg.edit_text(f"✅ *نتيجة الفحص:*\n\n{result}", parse_mode="Markdown")
 
-    msg = await update.message.reply_text(f"⏳ جارٍ فحص {len(products)} منتج...")
-    results = await check_all_prices(ctx.bot, notify=True)
-    await msg.edit_text(
-        f"✅ اكتمل الفحص!\n"
-        f"📦 المنتجات: {results['total']}\n"
-        f"🔔 تنبيهات: {results['alerts']}\n"
-        f"🎯 أهداف محققة: {results['targets']}\n"
-        f"❌ أخطاء: {results['errors']}"
+# ─── /status ──────────────────────────────────────────────
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    with get_conn() as conn:
+        total  = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        w_tgt  = conn.execute("SELECT COUNT(*) FROM products WHERE target_price IS NOT NULL").fetchone()[0]
+    await update.message.reply_text(
+        f"📊 *حالة البوت:*\n\n"
+        f"📦 المنتجات المتابَعة: *{total}*\n"
+        f"🎯 منتجات بهدف: *{w_tgt}*\n"
+        f"🕐 الفحص كل: *{CHECK_MINS} دقيقة*\n"
+        f"🕒 الوقت: *{datetime.now().strftime('%H:%M:%S')}*",
+        parse_mode="Markdown"
     )
 
-
+# ─── /remove ──────────────────────────────────────────────
 async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
-        await update.message.reply_text(
-            "استخدم: <code>/remove رقم</code>\n"
-            "مثال: <code>/remove 1</code>",
-            parse_mode="HTML"
-        )
+        await update.message.reply_text("❗ استخدم: /remove [id]")
         return
     try:
-        num = int(ctx.args[0])
+        pid = int(ctx.args[0])
     except ValueError:
-        await update.message.reply_text("❌ أدخل رقماً صحيحاً")
+        await update.message.reply_text("❗ أرسل رقم صحيح")
         return
+    with get_conn() as conn:
+        row = conn.execute("SELECT title FROM products WHERE id=?", (pid,)).fetchone()
+        if not row:
+            await update.message.reply_text(f"❗ لا يوجد منتج بـ ID: {pid}")
+            return
+        conn.execute("DELETE FROM price_history WHERE product_id=?", (pid,))
+        conn.execute("DELETE FROM products WHERE id=?", (pid,))
+    await update.message.reply_text(f"🗑 تم حذف: *{row['title'][:50]}*", parse_mode="Markdown")
 
-    products = db.get_all_products()
-    if num < 1 or num > len(products):
-        await update.message.reply_text(f"❌ رقم غير صحيح. المنتجات المتاحة: 1 — {len(products)}")
-        return
+# ─── Callbacks ────────────────────────────────────────────
+async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-    p = products[num - 1]
-    db.remove_product(p["id"])
-    await update.message.reply_text(f"✅ تم حذف: {p['title'][:60]}")
+    if query.data.startswith("del_"):
+        pid = int(query.data.split("_")[1])
+        with get_conn() as conn:
+            row = conn.execute("SELECT title FROM products WHERE id=?", (pid,)).fetchone()
+            conn.execute("DELETE FROM price_history WHERE product_id=?", (pid,))
+            conn.execute("DELETE FROM products WHERE id=?", (pid,))
+        name = row["title"][:40] if row else f"#{pid}"
+        await query.edit_message_text(f"🗑 تم حذف: *{name}*", parse_mode="Markdown")
 
+    elif query.data.startswith("info_"):
+        pid = int(query.data.split("_")[1])
+        with get_conn() as conn:
+            p = conn.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+            hist = conn.execute(
+                "SELECT price, recorded_at FROM price_history WHERE product_id=? ORDER BY recorded_at DESC LIMIT 5",
+                (pid,)
+            ).fetchall()
+        if not p:
+            return
+        hist_text = "\n".join(f"  • {h['price']:,.0f} — {h['recorded_at']}" for h in hist) or "  لا يوجد سجل"
+        price  = f"{p['current_price']:,.0f} {p['currency']}" if p["current_price"] else "غير متاح"
+        target = f"{p['target_price']:,.0f} {p['currency']}" if p["target_price"] else "لا يوجد"
+        await query.message.reply_text(
+            f"📦 *{p['title'][:60]}*\n\n"
+            f"💰 السعر الحالي: *{price}*\n"
+            f"🎯 المستهدف: *{target}*\n"
+            f"🕐 آخر فحص: {p['last_checked'] or 'لم يُفحص'}\n\n"
+            f"📈 *آخر 5 أسعار:*\n{hist_text}",
+            parse_mode="Markdown"
+        )
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    products = db.get_all_products()
-    count    = len(products)
-    alerts   = sum(1 for p in products if p.get("has_alert"))
-    targets  = sum(1 for p in products if p.get("target_reached"))
-    text = (
-        f"📊 <b>حالة البوت</b>\n\n"
-        f"📦 المنتجات المتابَعة: <b>{count}</b>\n"
-        f"🔔 منتجات بها تخفيض: <b>{alerts}</b>\n"
-        f"🎯 أهداف محققة: <b>{targets}</b>\n"
-        f"⏱ التحديث كل: <b>{CHECK_MINS} دقيقة</b>\n"
-        f"🕐 الوقت الحالي: <b>{datetime.now().strftime('%H:%M:%S')}</b>"
-    )
-    await update.message.reply_text(text, parse_mode="HTML")
+# ─── Price Check Job ──────────────────────────────────────
+async def check_prices(bot=None, notify=True) -> str:
+    with get_conn() as conn:
+        products = conn.execute("SELECT * FROM products").fetchall()
 
+    if not products:
+        return "لا يوجد منتجات."
 
-# ─── Callback ────────────────────────────────────────────────
-async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data.startswith("del_"):
-        pid = int(q.data.split("_")[1])
-        p   = db.get_product(pid)
-        if p:
-            db.remove_product(pid)
-            await q.edit_message_text(f"✅ تم حذف: {p['title'][:60]}")
-        else:
-            await q.answer("❌ المنتج غير موجود")
-
-
-# ─── Core check logic ────────────────────────────────────────
-async def check_all_prices(bot, notify=True):
-    products = db.get_all_products()
-    stats    = {"total": len(products), "alerts": 0, "targets": 0, "errors": 0}
-
+    lines = []
     for p in products:
-        try:
-            info = await asyncio.get_event_loop().run_in_executor(
-                None, scraper.get_product, p["url"]
+        data      = scrape_amazon(p["url"])
+        new_price = data["price"]
+
+        if not new_price:
+            lines.append(f"⚠️ #{p['id']} {p['title'][:25]}... تعذّر جلب السعر")
+            continue
+
+        old_price = p["current_price"]
+        target    = p["target_price"]
+
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE products SET current_price=?, prev_price=?, last_checked=? WHERE id=?",
+                (new_price, old_price, datetime.now().strftime("%H:%M %d/%m"), p["id"])
             )
-            if not info or info.get("price") is None:
-                stats["errors"] += 1
-                continue
+            conn.execute("INSERT INTO price_history (product_id, price) VALUES (?,?)", (p["id"], new_price))
 
-            now      = info["price"]
-            prev     = p["current_price"]
-            tgt      = p["target_price"]
-            currency = info.get("currency", p.get("currency", "EGP"))
-            title    = info.get("title") or p["title"]
+        arrow = ""
+        if old_price:
+            d = new_price - old_price
+            arrow = f" {'📉' if d < 0 else ('📈' if d > 0 else '✅')}{abs(d):,.0f}"
 
-            db.update_price(p["id"], now, title, currency)
+        lines.append(f"#{p['id']} {p['title'][:25]}... | {new_price:,.0f} {data['currency']}{arrow}")
 
-            if not notify:
-                continue
-
-            # 🔔 Price drop
-            if prev and now < prev:
-                saved = prev - now
-                pct   = saved / prev * 100
-                stats["alerts"] += 1
+        if notify and bot and CHAT_ID:
+            if old_price and new_price < old_price:
+                diff = old_price - new_price
                 await bot.send_message(
-                    chat_id    = CHAT_ID,
-                    parse_mode = "HTML",
-                    text = (
-                        f"🔔 <b>تخفيض جديد على أمازون!</b>\n\n"
-                        f"📦 <b>{title[:80]}</b>\n\n"
-                        f"💸 كان: <s>{fmt_price(prev, currency)}</s>\n"
-                        f"🔥 الآن: <b>{fmt_price(now, currency)}</b>\n"
-                        f"📉 التوفير: <b>{fmt_price(saved, currency)} ({pct:.1f}% خصم)</b>\n\n"
-                        f"🔗 <a href='{p['url']}'>افتح الصفحة</a>"
-                    )
+                    CHAT_ID,
+                    f"📉 *انخفض السعر!*\n\n"
+                    f"📦 {p['title'][:60]}\n"
+                    f"💰 {old_price:,.0f} ← *{new_price:,.0f} {data['currency']}*\n"
+                    f"✅ وفرت: *{diff:,.0f} {data['currency']}*\n"
+                    f"🔗 [فتح المنتج]({p['url']})",
+                    parse_mode="Markdown"
+                )
+            if target and new_price <= target:
+                await bot.send_message(
+                    CHAT_ID,
+                    f"🎯 *وصل السعر المستهدف!*\n\n"
+                    f"📦 {p['title'][:60]}\n"
+                    f"💰 السعر: *{new_price:,.0f} {data['currency']}*\n"
+                    f"🎯 المستهدف: {target:,.0f} {data['currency']}\n"
+                    f"🔗 [اشتري الآن]({p['url']})",
+                    parse_mode="Markdown"
                 )
 
-            # 🎯 Target reached
-            if tgt and now <= tgt:
-                stats["targets"] += 1
-                await bot.send_message(
-                    chat_id    = CHAT_ID,
-                    parse_mode = "HTML",
-                    text = (
-                        f"🎯 <b>تحقق السعر المستهدف! 🎉</b>\n\n"
-                        f"📦 <b>{title[:80]}</b>\n\n"
-                        f"✅ السعر الحالي: <b>{fmt_price(now, currency)}</b>\n"
-                        f"🎯 كان هدفك: {fmt_price(tgt, currency)}\n\n"
-                        f"🛒 <b>الفرصة متاحة الآن!</b>\n"
-                        f"🔗 <a href='{p['url']}'>اشتري الآن</a>"
-                    )
-                )
+    logger.info(f"✅ Checked {len(products)} products")
+    return "\n".join(lines)
 
-            # ⚡ Near target (within 10%)
-            elif tgt and now <= tgt * 1.10 and now > tgt:
-                diff_pct = (now - tgt) / tgt * 100
-                await bot.send_message(
-                    chat_id    = CHAT_ID,
-                    parse_mode = "HTML",
-                    text = (
-                        f"⚡ <b>قريب جداً من السعر المستهدف!</b>\n\n"
-                        f"📦 <b>{title[:80]}</b>\n\n"
-                        f"📊 السعر الحالي: <b>{fmt_price(now, currency)}</b>\n"
-                        f"🎯 السعر المستهدف: {fmt_price(tgt, currency)}\n"
-                        f"📈 الفرق: <b>{diff_pct:.1f}% فقط!</b>\n\n"
-                        f"👀 ترقّب السعر!\n"
-                        f"🔗 <a href='{p['url']}'>تابع المنتج</a>"
-                    )
-                )
-
-        except Exception as e:
-            logger.error(f"Error checking product {p['id']}: {e}")
-            stats["errors"] += 1
-
-    return stats
-
-
-async def scheduled_check(bot):
-    logger.info("⏰ Running scheduled price check...")
-    try:
-        results = await check_all_prices(bot, notify=True)
-        logger.info(f"✅ Check done: {results}")
-    except Exception as e:
-        logger.error(f"Scheduled check failed: {e}")
-
-
-# ─── Main ────────────────────────────────────────────────────
-def main():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN غير محدد في ملف .env")
-    if not CHAT_ID:
-        raise ValueError("CHAT_ID غير محدد في ملف .env")
-
-    db.init()
-    logger.info(f"🚀 Starting Amazon Tracker Bot (check every {CHECK_MINS} min)")
+# ─── Main ─────────────────────────────────────────────────
+async def main():
+    init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Conversation: /add
+    add_conv = ConversationHandler(
+        entry_points=[CommandHandler("add", add_step1_ask_url)],
+        states={
+            ASK_URL:    [MessageHandler(filters.TEXT & ~filters.COMMAND, add_step2_got_url)],
+            ASK_TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_step3_got_target)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_add)],
+        allow_reentry=True
+    )
+
+    app.add_handler(add_conv)
     app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("help",   cmd_help))
-    app.add_handler(CommandHandler("add",    cmd_add))
+    app.add_handler(CommandHandler("help",   cmd_start))
     app.add_handler(CommandHandler("list",   cmd_list))
     app.add_handler(CommandHandler("check",  cmd_check))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(CallbackQueryHandler(callback_handler))
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        scheduled_check,
-        "interval",
-        minutes   = CHECK_MINS,
-        args      = [app.bot],
-        id        = "price_check",
-        misfire_grace_time = 60
-    )
+    scheduler.add_job(check_prices, "interval", minutes=CHECK_MINS, args=[app.bot, True])
     scheduler.start()
-    logger.info(f"⏰ Scheduler started: every {CHECK_MINS} minutes")
 
-    app.run_polling(drop_pending_updates=True)
-
+    logger.info(f"🚀 Bot v2 started | Check every {CHECK_MINS} min")
+    await app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
